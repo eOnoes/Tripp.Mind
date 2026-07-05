@@ -1,0 +1,205 @@
+services:
+  siyuan:
+    image: b3log/siyuan:latest
+    command: ["serve", "--workspace=/siyuan/workspace/"]
+    environment:
+      SIYUAN_ACCESS_AUTH_CODE: ${SIYUAN_ACCESS_AUTH_CODE:?Set SIYUAN_ACCESS_AUTH_CODE in .env}
+      SIYUAN_WORKSPACE_PATH: /siyuan/workspace
+    volumes:
+      - siyuan_workspace:/siyuan/workspace
+    expose:
+      - "6806"
+    networks:
+      - siyuan_internal
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --timeout=5 -O /dev/null http://127.0.0.1:6806/system/version || wget -q --timeout=5 --spider http://127.0.0.1:6806/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    mem_limit: 1g
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
+    expose:
+      - "6379"
+    networks:
+      - siyuan_internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    mem_limit: 128m
+    restart: unless-stopped
+
+  gateway:
+    image: node:22-alpine
+    working_dir: /app
+    command: sh -c "npm install --omit=dev --no-audit --no-fund && npm start"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      SIYUAN_BASE_URL: http://siyuan:6806
+      SIYUAN_API_TOKEN: ${SIYUAN_API_TOKEN:-}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      JWT_ISSUER: ${JWT_ISSUER:-}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-}
+      DASHBOARD_CORS_ORIGIN: ${DASHBOARD_CORS_ORIGIN:-*}
+      REDIS_URL: redis://redis:6379
+      RATE_LIMIT_WINDOW_MS: 60000
+      RATE_LIMIT_MAX: 100
+    volumes:
+      - ./package.json:/app/package.json:ro
+      - ./server.js:/app/server.js:ro
+      - gateway_node_modules:/app/node_modules
+    ports:
+      - "${GATEWAY_PORT:-3000}:3000"
+    networks:
+      - siyuan_internal
+    depends_on:
+      siyuan:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  event-bridge:
+    image: node:22-alpine
+    working_dir: /app
+    command: sh -c "npm install --omit=dev --no-audit --no-fund && npm run event-bridge"
+    environment:
+      NODE_ENV: production
+      EVENT_BRIDGE_PORT: ${EVENT_BRIDGE_PORT:-3001}
+      SIYUAN_BASE_URL: http://siyuan:6806
+      SIYUAN_ACCESS_AUTH_CODE: ${SIYUAN_ACCESS_AUTH_CODE:?Set SIYUAN_ACCESS_AUTH_CODE in .env}
+      SIYUAN_X_AUTH_TOKEN: ${SIYUAN_X_AUTH_TOKEN:-}
+      EVENT_BRIDGE_AUTH_TOKEN: ${EVENT_BRIDGE_AUTH_TOKEN:-}
+      EVENT_BRIDGE_HEARTBEAT_MS: ${EVENT_BRIDGE_HEARTBEAT_MS:-30000}
+    volumes:
+      - ./package.json:/app/package.json:ro
+      - ./event-bridge.js:/app/event-bridge.js:ro
+      - ./lib:/app/lib:ro
+      - event_bridge_node_modules:/app/node_modules
+    ports:
+      - "${EVENT_BRIDGE_PORT:-3001}:${EVENT_BRIDGE_PORT:-3001}"
+    networks:
+      - siyuan_internal
+    depends_on:
+      siyuan:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:' + process.env.EVENT_BRIDGE_PORT + '/health').then(r=>process.exit(r.status < 500 ? 0 : 1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  backup-service:
+    image: node:22-alpine
+    working_dir: /app
+    command: sh -c "npm install --omit=dev --no-audit --no-fund && npm run backup-service"
+    environment:
+      NODE_ENV: production
+      SIYUAN_GATEWAY_URL: http://gateway:3000
+      SIYUAN_GATEWAY_TOKEN: ${SIYUAN_BACKUP_GATEWAY_TOKEN:-${SIYUAN_GATEWAY_TOKEN:?Set SIYUAN_GATEWAY_TOKEN or SIYUAN_BACKUP_GATEWAY_TOKEN in .env}}
+      BACKUP_DIR: /backups
+      BACKUP_CRON_SCHEDULE: ${BACKUP_CRON_SCHEDULE:-0 2 * * *}
+      BACKUP_RETENTION_COUNT: ${BACKUP_RETENTION_COUNT:-14}
+      BACKUP_RUN_ON_STARTUP: ${BACKUP_RUN_ON_STARTUP:-true}
+    volumes:
+      - ./package.json:/app/package.json:ro
+      - ./backup-service.js:/app/backup-service.js:ro
+      - ./lib:/app/lib:ro
+      - backups:/backups
+      - backup_node_modules:/app/node_modules
+    networks:
+      - siyuan_internal
+    depends_on:
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('fs').mkdirSync(process.env.BACKUP_DIR || '/backups', { recursive: true }); process.exit(0)\""]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  telegram-bot:
+    image: node:22-alpine
+    profiles: ["telegram"]
+    working_dir: /app
+    command: sh -c "npm install --omit=dev --no-audit --no-fund && npm run telegram-bot"
+    environment:
+      NODE_ENV: production
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ALLOWED_CHAT_IDS: ${TELEGRAM_ALLOWED_CHAT_IDS:-}
+      SIYUAN_GATEWAY_URL: http://gateway:3000
+      SIYUAN_GATEWAY_TOKEN: ${SIYUAN_BOT_GATEWAY_TOKEN:-${SIYUAN_GATEWAY_TOKEN:-}}
+      SIYUAN_DEFAULT_NOTEBOOK: ${SIYUAN_DEFAULT_NOTEBOOK:-}
+    volumes:
+      - ./package.json:/app/package.json:ro
+      - ./bots/telegram-bot.js:/app/bots/telegram-bot.js:ro
+      - ./lib:/app/lib:ro
+      - telegram_node_modules:/app/node_modules
+    networks:
+      - siyuan_internal
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
+
+  discord-bot:
+    image: node:22-alpine
+    profiles: ["discord"]
+    working_dir: /app
+    command: sh -c "npm install --omit=dev --no-audit --no-fund && npm run discord-bot"
+    environment:
+      NODE_ENV: production
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      DISCORD_APPLICATION_ID: ${DISCORD_APPLICATION_ID:-}
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
+      SIYUAN_GATEWAY_URL: http://gateway:3000
+      SIYUAN_GATEWAY_TOKEN: ${SIYUAN_BOT_GATEWAY_TOKEN:-${SIYUAN_GATEWAY_TOKEN:-}}
+      SIYUAN_DEFAULT_NOTEBOOK: ${SIYUAN_DEFAULT_NOTEBOOK:-}
+    volumes:
+      - ./package.json:/app/package.json:ro
+      - ./bots/discord-bot.js:/app/bots/discord-bot.js:ro
+      - ./lib:/app/lib:ro
+      - discord_node_modules:/app/node_modules
+    networks:
+      - siyuan_internal
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  siyuan_workspace:
+  redis_data:
+  backups:
+  gateway_node_modules:
+  event_bridge_node_modules:
+  backup_node_modules:
+  telegram_node_modules:
+  discord_node_modules:
+
+networks:
+  siyuan_internal:
+    driver: bridge
