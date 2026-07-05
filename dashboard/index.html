@@ -178,6 +178,23 @@
       height: 520px;
       display: block;
       background: #080d16;
+      cursor: grab;
+    }
+    #graph:active {
+      cursor: grabbing;
+    }
+    .node-label {
+      font-size: 10px;
+      fill: #eef3f8;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.3s ease;
+      text-anchor: middle;
+      dominant-baseline: central;
+    }
+    .node-label.visible {
+      opacity: 1;
+    }
     }
 
     .list {
@@ -452,36 +469,107 @@
       svg.selectAll("*").remove();
       svg.attr("viewBox", `0 0 ${width} ${height}`);
 
+      // --- Zoom group (pan + mouse wheel zoom) ---
+      const zoomGroup = svg.append("g");
+      const zoom = d3.zoom()
+        .scaleExtent([0.2, 8])
+        .on("zoom", (event) => {
+          zoomGroup.attr("transform", event.transform);
+          updateLabels(event.transform.k);
+        });
+      svg.call(zoom);
+
+      // --- Label visibility based on zoom level ---
+      let currentZoom = 1;
+      const LABEL_THRESHOLD = 1.8;
+      function updateLabels(k) {
+        currentZoom = k;
+        svg.selectAll(".node-label")
+          .classed("visible", k >= LABEL_THRESHOLD)
+          .attr("font-size", Math.max(8, 10 / Math.sqrt(k)) + "px");
+      }
+
       if (nodes.length === 0) {
         setStatus("graphStatus", "No graph data", "bad");
-        svg.append("text").attr("x", 24).attr("y", 48).attr("fill", "#91a0b4").text("No graph data available.");
+        zoomGroup.append("text").attr("x", 24).attr("y", 48).attr("fill", "#91a0b4").text("No graph data available.");
         return;
       }
 
       setStatus("graphStatus", "Live", "ok");
+
+      // --- Force simulation ---
+      const cx = width / 2;
+      const cy = height / 2;
       const simulation = d3.forceSimulation(nodes)
-        .force("link", d3.forceLink(links).id((node) => node.id).distance(70))
+        .force("link", d3.forceLink(links).id((node) => node.id).distance(60))
         .force("charge", d3.forceManyBody().strength(-130))
-        .force("center", d3.forceCenter(width / 2, height / 2))
+        .force("center", d3.forceCenter(cx, cy))
         .force("collision", d3.forceCollide(18));
 
-      const link = svg.append("g")
+      const link = zoomGroup.append("g")
         .attr("stroke", "#334155")
         .attr("stroke-opacity", 0.8)
         .selectAll("line")
         .data(links)
         .join("line");
 
-      const node = svg.append("g")
+      const node = zoomGroup.append("g")
         .selectAll("circle")
         .data(nodes)
         .join("circle")
         .attr("r", 6)
         .attr("fill", "#60a5fa")
+        .attr("stroke", "#1e3a5f")
+        .attr("stroke-width", 1.5)
         .call(drag(simulation));
 
-      node.append("title").text((node) => node.label || node.name || node.id);
+      // --- Node labels (visible when zoomed in past threshold) ---
+      const label = zoomGroup.append("g")
+        .selectAll("text")
+        .data(nodes)
+        .join("text")
+        .attr("class", "node-label")
+        .attr("dy", -12)
+        .text((d) => d.label || d.name || d.id);
 
+      // --- Tooltip on hover ---
+      node.append("title").text((d) => d.label || d.name || d.id);
+
+      // --- Rotation: slow spin when mouse is over the graph ---
+      let rotating = false;
+      let rotationRAF = null;
+      const ROTATION_SPEED = 0.008;
+
+      function startRotation() {
+        if (rotating) return;
+        rotating = true;
+        function tick() {
+          if (!rotating) return;
+          nodes.forEach((d) => {
+            if (d.fx !== null && d.fx !== undefined) return;
+            const dx = d.x - cx;
+            const dy = d.y - cy;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist > 10) {
+              d.vx += (-dy / dist) * ROTATION_SPEED;
+              d.vy += (dx / dist) * ROTATION_SPEED;
+            }
+          });
+          simulation.alpha(0.01).restart();
+          rotationRAF = requestAnimationFrame(tick);
+        }
+        tick();
+      }
+
+      function stopRotation() {
+        rotating = false;
+        if (rotationRAF) cancelAnimationFrame(rotationRAF);
+      }
+
+      svg.on("mouseenter", startRotation);
+      svg.on("mouseleave", stopRotation);
+
+      // --- Tick handler ---
       simulation.on("tick", () => {
         link
           .attr("x1", (d) => d.source.x)
@@ -491,7 +579,13 @@
         node
           .attr("cx", (d) => d.x)
           .attr("cy", (d) => d.y);
+        label
+          .attr("x", (d) => d.x)
+          .attr("y", (d) => d.y);
       });
+
+      // Start rotation if mouse is already over graph
+      if (element.matches(":hover")) startRotation();
     }
 
     function drag(simulation) {
